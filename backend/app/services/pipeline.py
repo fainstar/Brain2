@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import List, Tuple
+from typing import AsyncIterator, Dict, List, Tuple
 from uuid import uuid4
 
 from app.models import Entity, IngestRequest, IngestResponse, QueryRequest, QueryResponse, Relation
@@ -77,6 +77,52 @@ class BrainPipeline:
 {graph_section}
 """
 
+    def _build_query_prompt(self, question: str, context: str) -> str:
+        return f"""
+使用下面 context 協助分析，不要直接給單一結論。
+
+問題：{question}
+
+{context}
+
+請輸出 JSON：
+{{
+  "answer": "...",
+  "clarifying_questions": ["...", "...", "..."],
+  "contradictions": ["..."]
+}}
+""".strip()
+
+    def _parse_query_response(
+        self,
+        raw: str,
+        chunks: List[RetrievedChunk],
+        graph_facts: List[str],
+    ) -> QueryResponse:
+        data = parse_json_block(raw)
+        answer = data.get("answer") or raw
+        clarifying = data.get("clarifying_questions") or []
+        contradictions = data.get("contradictions") or []
+        used_note_ids = dedupe_preserve_order([c.note_id for c in chunks])
+
+        return QueryResponse(
+            answer=answer,
+            clarifying_questions=clarifying[:3],
+            contradictions=contradictions[:5],
+            used_note_ids=used_note_ids,
+            graph_facts=graph_facts,
+        )
+
+    async def _prepare_query(self, req: QueryRequest) -> Tuple[List[RetrievedChunk], List[str], str]:
+        query_embedding = await self.llm.embed(req.question)
+        chunks = await self.vector_store.search(req.question, query_embedding, req.top_k)
+
+        keyword = req.question.strip().split()[0] if req.question.strip().split() else req.question[:6]
+        graph_facts = await self.graph_store.search_related(keyword=keyword, limit=10)
+        context = self._build_context(chunks, graph_facts)
+        prompt = self._build_query_prompt(req.question, context)
+        return chunks, graph_facts, prompt
+
     async def ingest(self, req: IngestRequest) -> IngestResponse:
         now = datetime.now(timezone.utc)
         note_id = f"note-{uuid4().hex[:12]}"
@@ -106,41 +152,24 @@ class BrainPipeline:
         )
 
     async def query(self, req: QueryRequest) -> QueryResponse:
-        query_embedding = await self.llm.embed(req.question)
-        chunks = await self.vector_store.search(req.question, query_embedding, req.top_k)
-
-        keyword = req.question.strip().split()[0] if req.question.strip().split() else req.question[:6]
-        graph_facts = await self.graph_store.search_related(keyword=keyword, limit=10)
-        context = self._build_context(chunks, graph_facts)
-
-        prompt = f"""
-使用下面 context 協助分析，不要直接給單一結論。
-
-問題：{req.question}
-
-{context}
-
-請輸出 JSON：
-{{
-  "answer": "...",
-  "clarifying_questions": ["...", "...", "..."],
-  "contradictions": ["..."]
-}}
-""".strip()
-
+        chunks, graph_facts, prompt = await self._prepare_query(req)
         raw = await self.llm.chat(SYSTEM_PROMPT, prompt, temperature=0.2)
-        data = parse_json_block(raw)
+        return self._parse_query_response(raw, chunks, graph_facts)
 
-        answer = data.get("answer") or raw
-        clarifying = data.get("clarifying_questions") or []
-        contradictions = data.get("contradictions") or []
+    async def query_stream_events(self, req: QueryRequest) -> AsyncIterator[Dict]:
+        chunks, graph_facts, prompt = await self._prepare_query(req)
 
-        used_note_ids = dedupe_preserve_order([c.note_id for c in chunks])
+        raw_parts: List[str] = []
 
-        return QueryResponse(
-            answer=answer,
-            clarifying_questions=clarifying[:3],
-            contradictions=contradictions[:5],
-            used_note_ids=used_note_ids,
-            graph_facts=graph_facts,
-        )
+        async for token in self.llm.chat_stream(SYSTEM_PROMPT, prompt, temperature=0.2):
+            raw_parts.append(token)
+            if token:
+                yield {"type": "answer_delta", "delta": token}
+
+        raw = "".join(raw_parts)
+        result = self._parse_query_response(raw, chunks, graph_facts)
+
+        if result.answer:
+            yield {"type": "answer_replace", "answer": result.answer}
+
+        yield {"type": "done", "result": result.model_dump(mode="json")}

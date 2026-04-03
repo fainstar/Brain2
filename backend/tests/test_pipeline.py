@@ -19,6 +19,19 @@ class FakeLLM:
     async def ping(self) -> bool:
         return True
 
+    async def chat_stream(self, system_prompt: str, user_prompt: str, temperature: float = 0.2):
+        if "資訊抽取器" in system_prompt:
+            yield '{"entities":[],"relations":[]}'
+            return
+
+        text = (
+            '{"answer":"先定義效能指標再決定是否重構。",'
+            '"clarifying_questions":["目前 p95 latency 是多少？","近期錯誤率變化？","重構範圍是否可分階段？"],'
+            '"contradictions":["想重構但又擔心效能下滑"]}'
+        )
+        for chunk in [text[:18], text[18:44], text[44:80], text[80:]]:
+            yield chunk
+
 
 @pytest.mark.asyncio
 async def test_ingest_then_query():
@@ -37,3 +50,31 @@ async def test_ingest_then_query():
     query_res = await pipeline.query(QueryRequest(question="我該不該現在重構？", top_k=3))
     assert "效能" in query_res.answer or "重構" in query_res.answer
     assert len(query_res.clarifying_questions) == 3
+
+
+@pytest.mark.asyncio
+async def test_query_stream_events():
+    pipeline = BrainPipeline(
+        llm=FakeLLM(),
+        vector_store=InMemoryVectorStore(),
+        graph_store=InMemoryGraphStore(),
+    )
+
+    await pipeline.ingest(
+        IngestRequest(text="最近覺得 API 架構很怪，想重構但怕拖垮效能", source="manual")
+    )
+
+    deltas = []
+    done_result = None
+    async for event in pipeline.query_stream_events(QueryRequest(question="我該不該現在重構？", top_k=3)):
+        if event.get("type") == "answer_delta":
+            deltas.append(event.get("delta", ""))
+        if event.get("type") == "done":
+            done_result = event.get("result")
+
+    streamed_answer = "".join(deltas)
+    assert streamed_answer
+    assert "重構" in streamed_answer
+    assert done_result is not None
+    assert "answer" in done_result
+    assert len(done_result.get("clarifying_questions", [])) == 3

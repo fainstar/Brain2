@@ -1,5 +1,7 @@
+import json
+
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.config import settings
 from app.dependencies import build_pipeline
@@ -43,6 +45,23 @@ async def ingest(payload: IngestRequest):
 async def query(payload: QueryRequest):
     result = await pipeline.query(payload)
     return JSONResponse(content=result.model_dump(mode="json"))
+
+
+@app.post("/query/stream")
+async def query_stream(payload: QueryRequest):
+    async def event_stream():
+        try:
+            async for event in pipeline.query_stream_events(payload):
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        except Exception as exc:
+            error_event = {"type": "error", "message": str(exc)}
+            yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/memory", response_model=MemoryListResponse)

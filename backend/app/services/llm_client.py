@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import List
+import json
+from typing import AsyncIterator, List
 
 import httpx
 
@@ -39,6 +40,51 @@ class LLMClient:
             response.raise_for_status()
             data = response.json()
             return data["choices"][0]["message"]["content"]
+
+    async def chat_stream(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.2,
+    ) -> AsyncIterator[str]:
+        payload = {
+            "model": self.chat_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+            "stream": True,
+        }
+
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream(
+                "POST",
+                f"{self.base_url}/chat/completions",
+                headers=self._headers(),
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+                async for raw_line in response.aiter_lines():
+                    line = (raw_line or "").strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+
+                    data_text = line[len("data:"):].strip()
+                    if data_text == "[DONE]":
+                        break
+
+                    try:
+                        data = json.loads(data_text)
+                        delta = (
+                            data.get("choices", [{}])[0]
+                            .get("delta", {})
+                            .get("content")
+                        )
+                        if delta:
+                            yield delta
+                    except (json.JSONDecodeError, IndexError, TypeError):
+                        continue
 
     async def embed(self, text: str) -> List[float]:
         payload = {"model": self.embed_model, "input": text}

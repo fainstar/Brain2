@@ -18,6 +18,27 @@ def call_api(method: str, path: str, **kwargs):
     return resp.json()
 
 
+def stream_query_events(question: str, top_k: int):
+    url = f"{BACKEND_URL}/query/stream"
+    payload = {"question": question, "top_k": top_k}
+
+    with requests.post(url, json=payload, stream=True, timeout=(10, 300)) as resp:
+        resp.raise_for_status()
+        for raw_line in resp.iter_lines(decode_unicode=True):
+            line = (raw_line or "").strip()
+            if not line or not line.startswith("data:"):
+                continue
+
+            data_text = line[len("data:"):].strip()
+            if not data_text:
+                continue
+
+            try:
+                yield json.loads(data_text)
+            except json.JSONDecodeError:
+                continue
+
+
 def format_timestamp(value: str | None) -> str:
     if not value:
         return "未知時間"
@@ -152,6 +173,11 @@ tab_chat, tab_memory, tab_graph = st.tabs(["💬 聊天決策", "🗂️ 記憶�
 
 with tab_chat:
     st.subheader("聊天決策輔助")
+
+    with st.form("chat_prompt_form", clear_on_submit=True):
+        user_prompt = st.text_input("輸入你的問題（會自動更新記憶與思維圖）", key="chat_prompt_input")
+        submit_prompt = st.form_submit_button("送出問題", type="primary")
+
     try:
         conv_data = call_api("GET", "/conversations", params={"limit": 100})
         # backend 已回傳 timestamp 新到舊，前端維持同順序（最新在上）
@@ -269,17 +295,43 @@ with tab_chat:
         except Exception as exc:
             st.error(f"人工重試失敗: {exc}")
 
-    user_prompt = st.chat_input("輸入你的問題（會自動更新記憶與思維圖）")
-    if user_prompt and user_prompt.strip():
+    if submit_prompt and user_prompt and user_prompt.strip():
         try:
             prompt = user_prompt.strip()
             ingest_payload = {"text": prompt, "source": "streamlit-chat"}
             ingest_result = call_api("POST", "/ingest", json=ingest_payload)
 
-            query_payload = {"question": prompt, "top_k": top_k}
-            query_result = call_api("POST", "/query", json=query_payload)
+            stream_holder = st.empty()
+            stream_holder.markdown("**回答生成中...**")
+            streamed_answer = ""
+            query_result = {
+                "answer": "",
+                "clarifying_questions": [],
+                "contradictions": [],
+                "used_note_ids": [],
+                "graph_facts": [],
+            }
 
-            call_api(
+            for event in stream_query_events(prompt, top_k):
+                event_type = event.get("type")
+                if event_type == "answer_delta":
+                    streamed_answer += event.get("delta", "")
+                    stream_holder.markdown(streamed_answer or "**回答生成中...**")
+                elif event_type == "answer_replace":
+                    streamed_answer = event.get("answer", "")
+                    stream_holder.markdown(streamed_answer or "**回答生成中...**")
+                elif event_type == "done":
+                    query_result = event.get("result", query_result)
+                    final_answer = query_result.get("answer") or streamed_answer
+                    if final_answer:
+                        stream_holder.markdown(final_answer)
+                elif event_type == "error":
+                    raise RuntimeError(event.get("message", "串流查詢失敗"))
+
+            if not query_result.get("answer") and streamed_answer:
+                query_result["answer"] = streamed_answer
+
+            created_conv = call_api(
                 "POST",
                 "/conversations",
                 json={
@@ -295,7 +347,30 @@ with tab_chat:
                 },
             )
 
-            st.rerun()
+            final_timestamp = format_timestamp(created_conv.get("timestamp"))
+            final_answer = query_result.get("answer", "") or streamed_answer
+            final_clarifying = query_result.get("clarifying_questions", [])
+            final_contradictions = query_result.get("contradictions", [])
+
+            stream_holder.empty()
+
+            with st.chat_message("user"):
+                st.write(prompt)
+                st.caption(f"🕒 {final_timestamp}")
+
+            with st.chat_message("assistant"):
+                st.write(final_answer)
+                st.caption(f"🕒 {final_timestamp}")
+                if final_clarifying:
+                    st.markdown("**釐清問題**")
+                    for item in final_clarifying:
+                        st.markdown(f"- {item}")
+                if final_contradictions:
+                    st.markdown("**矛盾點**")
+                    for item in final_contradictions:
+                        st.markdown(f"- {item}")
+
+            st.success("串流完成，已寫入聊天紀錄。")
         except Exception as exc:
             st.error(f"查詢失敗: {exc}")
 
