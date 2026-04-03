@@ -1,0 +1,14 @@
+# Python virtual environments
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local secrets
+.env
+
+# Runtime database files
+data/
+data/
