@@ -154,7 +154,8 @@ with tab_chat:
     st.subheader("聊天決策輔助")
     try:
         conv_data = call_api("GET", "/conversations", params={"limit": 100})
-        conversations = list(reversed(conv_data.get("items", [])))
+        # backend 已回傳 timestamp 新到舊，前端維持同順序（最新在上）
+        conversations = conv_data.get("items", [])
     except Exception as exc:
         st.error(f"讀取對話歷史失敗: {exc}")
         conversations = []
@@ -165,9 +166,9 @@ with tab_chat:
     with control_left:
         top_k = st.slider("檢索記憶數量 top_k", min_value=1, max_value=20, value=5)
         if conversations:
-            last_question = conversations[-1].get("question", "")
+            last_question = conversations[0].get("question", "")
             if st.button("🔁 人工重試上一題", type="primary"):
-                retry_target = conversations[-1]
+                retry_target = conversations[0]
                 st.info(f"正在人工重試：{last_question[:60]}{'...' if len(last_question) > 60 else ''}")
     with control_right:
         confirm_clear_chat = st.checkbox("我確定要清除全部聊天紀錄", value=False)
